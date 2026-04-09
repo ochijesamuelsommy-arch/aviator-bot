@@ -1,9 +1,9 @@
 import os
 import telebot
 
-raw_token = os.getenv("BOT_TOKEN")
+DATA_FILE = "aviator_data.csv"
 
-# 🔥 HARD FIX: remove hidden spaces + newlines
+raw_token = os.getenv("BOT_TOKEN")
 BOT_TOKEN = raw_token.strip() if raw_token else None
 
 print("TOKEN CHECK:", repr(BOT_TOKEN))
