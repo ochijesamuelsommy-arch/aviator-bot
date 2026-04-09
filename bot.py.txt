@@ -1,14 +1,12 @@
-import telebot
-import pandas as pd
-import numpy as np
 import os
+import telebot
 
-# ================== CONFIG ==================
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-DATA_FILE = "aviator_data.csv"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+
+if BOT_TOKEN is None:
+    print("ERROR: BOT_TOKEN not found")
 
 bot = telebot.TeleBot(BOT_TOKEN)
-
 # ================== LOAD DATA ==================
 if os.path.exists(DATA_FILE):
     df = pd.read_csv(DATA_FILE)
