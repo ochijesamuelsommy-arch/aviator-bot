@@ -1,9 +1,15 @@
 import os
 import telebot
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+raw_token = os.getenv("BOT_TOKEN")
+
+# 🔥 HARD FIX: remove hidden spaces + newlines
+BOT_TOKEN = raw_token.strip() if raw_token else None
 
 print("TOKEN CHECK:", repr(BOT_TOKEN))
+
+if not BOT_TOKEN:
+    raise Exception("BOT_TOKEN missing")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 # ================== LOAD DATA ==================
