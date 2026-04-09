@@ -1,5 +1,6 @@
 import os
 import telebot
+import pandas as pd
 
 DATA_FILE = "aviator_data.csv"
 
