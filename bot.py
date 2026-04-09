@@ -3,8 +3,7 @@ import telebot
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-if BOT_TOKEN is None:
-    print("ERROR: BOT_TOKEN not found")
+print("TOKEN CHECK:", repr(BOT_TOKEN))
 
 bot = telebot.TeleBot(BOT_TOKEN)
 # ================== LOAD DATA ==================
