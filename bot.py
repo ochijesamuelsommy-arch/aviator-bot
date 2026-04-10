@@ -12,41 +12,60 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout
 # =========================
 DATA_FILE = "aviator_data.csv"
 SEQ_LEN = 10
-MIN_DATA = 50  # AI activation threshold
+MIN_DATA = 50
 
 # =========================
-# TOKEN SAFE LOAD
+# TOKEN
 # =========================
-raw_token = os.getenv("BOT_TOKEN")
-BOT_TOKEN = raw_token.strip() if raw_token else None
-
-print("TOKEN CHECK:", repr(BOT_TOKEN))
-
-if not BOT_TOKEN:
-    raise Exception("BOT_TOKEN missing")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = BOT_TOKEN.strip() if BOT_TOKEN else None
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # =========================
-# LOAD DATA
+# DATA LOAD
 # =========================
 if os.path.exists(DATA_FILE):
     df = pd.read_csv(DATA_FILE)
 else:
     df = pd.DataFrame(columns=["multiplier"])
 
-# =========================
-# SCALER + MODEL
-# =========================
 scaler = MinMaxScaler()
 model = None
+
+# =========================
+# 🧼 AUTO CLEAN FUNCTION
+# =========================
+def clean_value(value):
+    # 1. clamp extreme values
+    value = max(1.01, min(value, 20))
+
+    # 2. smooth rounding noise
+    value = round(value, 2)
+
+    return value
+
+
+def clean_series(series):
+    arr = np.array(series)
+
+    # median smoothing (removes spikes)
+    for i in range(len(arr)):
+        if i > 0:
+            diff = abs(arr[i] - arr[i - 1])
+            if diff > 5:  # spike detection
+                arr[i] = (arr[i] + arr[i - 1]) / 2
+
+    return arr
 
 
 # =========================
 # DATA PREP
 # =========================
 def prepare_data(series):
-    values = series.values.reshape(-1, 1)
+    cleaned = clean_series(series.values)
+
+    values = cleaned.reshape(-1, 1)
     scaled = scaler.fit_transform(values)
 
     X, y = [], []
@@ -59,27 +78,24 @@ def prepare_data(series):
 
 
 # =========================
-# MODEL (IMPROVED ARCHITECTURE)
+# MODEL (IMPROVED)
 # =========================
 def build_model():
-    m = Sequential()
+    model = Sequential()
 
-    m.add(LSTM(96, return_sequences=True, input_shape=(SEQ_LEN, 1)))
-    m.add(Dropout(0.2))
+    model.add(LSTM(96, return_sequences=True, input_shape=(SEQ_LEN, 1)))
+    model.add(Dropout(0.2))
 
-    m.add(LSTM(48))
-    m.add(Dropout(0.2))
+    model.add(LSTM(48))
+    model.add(Dropout(0.2))
 
-    m.add(Dense(32, activation="relu"))
-    m.add(Dense(1))
+    model.add(Dense(32, activation="relu"))
+    model.add(Dense(1))
 
-    m.compile(optimizer="adam", loss="mse")
-    return m
+    model.compile(optimizer="adam", loss="mse")
+    return model
 
 
-# =========================
-# TRAIN (CONTROLLED)
-# =========================
 def train_model():
     global model
 
@@ -91,36 +107,11 @@ def train_model():
     if model is None:
         model = build_model()
 
-    model.fit(
-        X, y,
-        epochs=20,
-        batch_size=8,
-        verbose=0
-    )
+    model.fit(X, y, epochs=20, batch_size=8, verbose=0)
 
 
 # =========================
-# FALLBACK (SMART STATISTICS MODEL)
-# =========================
-def fallback_predict(seq):
-    arr = np.array(seq)
-
-    mean = np.mean(arr)
-    std = np.std(arr)
-
-    # trend detection
-    trend = (arr[-1] - arr[0]) if len(arr) > 1 else 0
-
-    prediction = mean + (trend * 0.3)
-
-    # clamp unrealistic values
-    prediction = max(1.01, min(prediction, 15))
-
-    return round(float(prediction), 2)
-
-
-# =========================
-# AI PREDICTION
+# PREDICTION
 # =========================
 def ai_predict(seq):
     global model
@@ -140,83 +131,52 @@ def ai_predict(seq):
     return round(float(value), 2)
 
 
+def fallback_predict(seq):
+    arr = np.array(seq)
+    return round(float(np.mean(arr) + (arr[-1] - arr[0]) * 0.3), 2)
+
+
 # =========================
 # COMMANDS
 # =========================
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.reply_to(
-        message,
-        "🤖 Smart Hybrid AI Bot Ready!\n"
-        "/add value\n/predict numbers\n/analyze"
-    )
-
-
 @bot.message_handler(commands=['add'])
-def add_data(message):
+def add(message):
     global df
 
     try:
         value = float(message.text.split()[1])
 
-        # filter bad data
-        if value <= 1.0 or value > 20:
-            bot.reply_to(message, "❌ Invalid value ignored")
-            return
+        # 🧼 AUTO CLEAN (NO REJECTION)
+        value = clean_value(value)
 
-        df = pd.concat([df, pd.DataFrame([{"multiplier": value}])], ignore_index=True)
+        df = pd.concat(
+            [df, pd.DataFrame([{"multiplier": value}])],
+            ignore_index=True
+        )
+
         df.to_csv(DATA_FILE, index=False)
 
         train_model()
 
-        bot.reply_to(message, f"✅ Added: {value}")
+        bot.reply_to(message, f"✅ Added (cleaned): {value}")
 
     except:
         bot.reply_to(message, "❌ Usage: /add 1.5")
 
 
-@bot.message_handler(commands=['analyze'])
-def analyze(message):
-    try:
-        if len(df) < 5:
-            bot.reply_to(message, "⚠️ Not enough data")
-            return
-
-        bot.reply_to(
-            message,
-            f"📊 Stats:\n"
-            f"Count: {len(df)}\n"
-            f"Mean: {df['multiplier'].mean():.2f}\n"
-            f"Std: {df['multiplier'].std():.2f}"
-        )
-
-    except Exception as e:
-        bot.reply_to(message, str(e))
-
-
 @bot.message_handler(commands=['predict'])
 def predict(message):
     try:
-        parts = message.text.split()[1:]
-        numbers = list(map(float, parts))
-
-        if len(numbers) < 4:
-            bot.reply_to(message, "❌ Example: /predict 1.2 2.0 1.5 3.1")
-            return
-
-        # =========================
-        # HYBRID ENGINE (BEST PART)
-        # =========================
+        numbers = list(map(float, message.text.split()[1:]))
 
         if len(df) >= MIN_DATA:
             pred = ai_predict(numbers)
             mode = "AI MODEL"
         else:
             pred = fallback_predict(numbers)
-            mode = "FALLBACK MODE"
+            mode = "FALLBACK"
 
-        # classification
         if pred < 1.5:
             label = "LOW"
         elif pred < 3:
@@ -224,25 +184,20 @@ def predict(message):
         else:
             label = "HIGH"
 
-        # confidence logic
-        confidence = min(
-            95,
-            max(55, int(100 - abs(pred - np.mean(numbers)) * 8))
-        )
-
         bot.reply_to(
             message,
-            f"✈️ Prediction ({mode})\n"
-            f"Result: {label} — {pred}x\n"
-            f"Confidence: {confidence}%"
+            f"✈️ {mode}\n"
+            f"Result: {label} — {pred}x"
         )
 
     except Exception as e:
-        bot.reply_to(message, f"Error: {str(e)}")
+        bot.reply_to(message, f"Error: {e}")
 
 
-# =========================
-# RUN
-# =========================
-print("🤖 Hybrid Bot Running...")
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, "🤖 Auto-Clean AI Bot Ready")
+
+
+print("Bot running...")
 bot.infinity_polling()
