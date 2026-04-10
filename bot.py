@@ -11,42 +11,24 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout
 # CONFIG
 # =========================
 DATA_FILE = "aviator_data.csv"
-MEMORY_FILE = "error_memory.csv"
-
 SEQ_LEN = 10
-MIN_DATA = 50
+MIN_DATA = 60
 
-# =========================
-# TOKEN
-# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_TOKEN = BOT_TOKEN.strip() if BOT_TOKEN else None
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # =========================
-# DATA LOAD
+# DATA
 # =========================
 if os.path.exists(DATA_FILE):
     df = pd.read_csv(DATA_FILE)
 else:
     df = pd.DataFrame(columns=["multiplier"])
 
-if os.path.exists(MEMORY_FILE):
-    memory = pd.read_csv(MEMORY_FILE)
-else:
-    memory = pd.DataFrame(columns=["predicted", "actual", "error"])
-
 scaler = MinMaxScaler()
 model = None
-
-
-# =========================
-# CLEANING
-# =========================
-def clean(v):
-    v = max(1.01, min(v, 20))
-    return round(v, 2)
 
 
 # =========================
@@ -64,25 +46,22 @@ def build_model():
     return m
 
 
-def prepare(series):
-    arr = series.values.reshape(-1, 1)
-    scaled = scaler.fit_transform(arr)
-
-    X, y = [], []
-    for i in range(SEQ_LEN, len(scaled)):
-        X.append(scaled[i-SEQ_LEN:i])
-        y.append(scaled[i])
-
-    return np.array(X), np.array(y)
-
-
-def train():
+def train_model():
     global model
 
     if len(df) < MIN_DATA:
         return
 
-    X, y = prepare(df["multiplier"])
+    arr = df["multiplier"].values.reshape(-1, 1)
+    scaled = scaler.fit_transform(arr)
+
+    X, y = [], []
+
+    for i in range(SEQ_LEN, len(scaled)):
+        X.append(scaled[i-SEQ_LEN:i])
+        y.append(scaled[i])
+
+    X, y = np.array(X), np.array(y)
 
     if model is None:
         model = build_model()
@@ -91,23 +70,12 @@ def train():
 
 
 # =========================
-# 🧠 SELF LEARNING BIAS CORRECTION
+# ENSEMBLE MODELS
 # =========================
-def get_bias():
-    if len(memory) < 5:
-        return 0
 
-    return memory["error"].mean()
-
-
-# =========================
-# PREDICT (WITH SELF LEARNING)
-# =========================
-def predict(seq):
-    global model
-
-    if len(df) < MIN_DATA or model is None:
-        return np.mean(seq)
+def model_lstm(seq):
+    if model is None:
+        return None
 
     if len(seq) < SEQ_LEN:
         seq = [np.mean(seq)] * (SEQ_LEN - len(seq)) + seq
@@ -116,33 +84,54 @@ def predict(seq):
     scaled = scaler.transform(arr)
 
     pred = model.predict(scaled.reshape(1, SEQ_LEN, 1), verbose=0)
-    value = scaler.inverse_transform(pred)[0][0]
+    return scaler.inverse_transform(pred)[0][0]
 
-    # 🔥 APPLY LEARNED BIAS CORRECTION
-    bias = get_bias()
-    value = value - bias
 
-    return round(float(value), 2)
+def model_stat(seq):
+    arr = np.array(seq)
+
+    mean = np.mean(arr)
+    std = np.std(arr)
+
+    # probabilistic spread model
+    return mean + (np.random.randn() * std * 0.1)
+
+
+def model_trend(seq):
+    arr = np.array(seq)
+    if len(arr) < 2:
+        return np.mean(arr)
+
+    trend = arr[-1] - arr[0]
+    return np.mean(arr) + trend * 0.4
 
 
 # =========================
-# UPDATE MEMORY (SELF LEARNING CORE)
+# PROBABILITY ENGINE
 # =========================
-def update_memory(predicted, actual):
-    global memory
+def probability_engine(seq):
+    lstm = model_lstm(seq)
+    stat = model_stat(seq)
+    trend = model_trend(seq)
 
-    error = actual - predicted
+    predictions = [p for p in [lstm, stat, trend] if p is not None]
 
-    memory = pd.concat([
-        memory,
-        pd.DataFrame([{
-            "predicted": predicted,
-            "actual": actual,
-            "error": error
-        }])
-    ], ignore_index=True)
+    final = np.mean(predictions)
 
-    memory.to_csv(MEMORY_FILE, index=False)
+    # probability buckets
+    low_p = max(0, 100 - final * 35)
+    mid_p = max(0, 100 - abs(final - 2.0) * 40)
+    high_p = max(0, final * 20)
+
+    total = low_p + mid_p + high_p
+    if total == 0:
+        total = 1
+
+    low_p = round((low_p / total) * 100, 2)
+    mid_p = round((mid_p / total) * 100, 2)
+    high_p = round((high_p / total) * 100, 2)
+
+    return final, low_p, mid_p, high_p
 
 
 # =========================
@@ -154,16 +143,13 @@ def add(message):
     global df
 
     try:
-        value = clean(float(message.text.split()[1]))
+        value = float(message.text.split()[1])
+        value = max(1.01, min(value, 20))
 
-        df = pd.concat(
-            [df, pd.DataFrame([{"multiplier": value}])],
-            ignore_index=True
-        )
-
+        df = pd.concat([df, pd.DataFrame([{"multiplier": value}])], ignore_index=True)
         df.to_csv(DATA_FILE, index=False)
 
-        train()
+        train_model()
 
         bot.reply_to(message, f"✅ Added: {value}")
 
@@ -172,61 +158,42 @@ def add(message):
 
 
 @bot.message_handler(commands=['predict'])
-def handle_predict(message):
+def predict(message):
     try:
-        numbers = list(map(float, message.text.split()[1:]))
+        seq = list(map(float, message.text.split()[1:]))
 
-        pred = predict(numbers)
+        if len(df) < 20:
+            bot.reply_to(message, "⚠️ Need more data (20+ recommended)")
+            return
 
-        label = "LOW" if pred < 1.5 else "MID" if pred < 3 else "HIGH"
+        final, low_p, mid_p, high_p = probability_engine(seq)
+
+        label = "LOW" if low_p > max(mid_p, high_p) else "MID" if mid_p > high_p else "HIGH"
 
         bot.reply_to(
             message,
-            f"✈️ Prediction: {label} — {pred}x"
+            f"🧠 EXPERT ENSEMBLE AI\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"Prediction: {final:.2f}x\n\n"
+            f"📊 Probabilities:\n"
+            f"LOW: {low_p}%\n"
+            f"MID: {mid_p}%\n"
+            f"HIGH: {high_p}%\n\n"
+            f"🎯 Signal: {label}"
         )
 
     except Exception as e:
-        bot.reply_to(message, str(e))
-
-
-# =========================
-# OPTIONAL: FEEDBACK LEARNING
-# =========================
-@bot.message_handler(commands=['result'])
-def result(message):
-    """
-    User sends real outcome:
-    /result 2.1
-    Bot learns from last prediction
-    """
-    global memory
-
-    try:
-        actual = float(message.text.split()[1])
-        actual = clean(actual)
-
-        if len(memory) == 0:
-            bot.reply_to(message, "⚠️ No prediction to compare")
-            return
-
-        last_pred = memory.iloc[-1]["predicted"]
-
-        update_memory(last_pred, actual)
-
-        bot.reply_to(message, "🧠 Learned from mistake!")
-
-    except:
-        bot.reply_to(message, "❌ Usage: /result 2.1")
+        bot.reply_to(message, f"Error: {e}")
 
 
 @bot.message_handler(commands=['start'])
 def start(message):
     bot.reply_to(
         message,
-        "🤖 Self-Learning AI Bot Active\n"
-        "/add /predict /result"
+        "🤖 Expert Ensemble Bot Active\n"
+        "/add /predict"
     )
 
 
-print("🤖 Self-learning bot running...")
+print("🚀 Expert bot running...")
 bot.infinity_polling()
