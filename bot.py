@@ -11,6 +11,8 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout
 # CONFIG
 # =========================
 DATA_FILE = "aviator_data.csv"
+MEMORY_FILE = "error_memory.csv"
+
 SEQ_LEN = 10
 MIN_DATA = 50
 
@@ -30,46 +32,43 @@ if os.path.exists(DATA_FILE):
 else:
     df = pd.DataFrame(columns=["multiplier"])
 
+if os.path.exists(MEMORY_FILE):
+    memory = pd.read_csv(MEMORY_FILE)
+else:
+    memory = pd.DataFrame(columns=["predicted", "actual", "error"])
+
 scaler = MinMaxScaler()
 model = None
 
+
 # =========================
-# 🧼 AUTO CLEAN FUNCTION
+# CLEANING
 # =========================
-def clean_value(value):
-    # 1. clamp extreme values
-    value = max(1.01, min(value, 20))
-
-    # 2. smooth rounding noise
-    value = round(value, 2)
-
-    return value
-
-
-def clean_series(series):
-    arr = np.array(series)
-
-    # median smoothing (removes spikes)
-    for i in range(len(arr)):
-        if i > 0:
-            diff = abs(arr[i] - arr[i - 1])
-            if diff > 5:  # spike detection
-                arr[i] = (arr[i] + arr[i - 1]) / 2
-
-    return arr
+def clean(v):
+    v = max(1.01, min(v, 20))
+    return round(v, 2)
 
 
 # =========================
-# DATA PREP
+# MODEL
 # =========================
-def prepare_data(series):
-    cleaned = clean_series(series.values)
+def build_model():
+    m = Sequential()
+    m.add(LSTM(96, return_sequences=True, input_shape=(SEQ_LEN, 1)))
+    m.add(Dropout(0.2))
+    m.add(LSTM(48))
+    m.add(Dropout(0.2))
+    m.add(Dense(32, activation="relu"))
+    m.add(Dense(1))
+    m.compile(optimizer="adam", loss="mse")
+    return m
 
-    values = cleaned.reshape(-1, 1)
-    scaled = scaler.fit_transform(values)
+
+def prepare(series):
+    arr = series.values.reshape(-1, 1)
+    scaled = scaler.fit_transform(arr)
 
     X, y = [], []
-
     for i in range(SEQ_LEN, len(scaled)):
         X.append(scaled[i-SEQ_LEN:i])
         y.append(scaled[i])
@@ -77,32 +76,13 @@ def prepare_data(series):
     return np.array(X), np.array(y)
 
 
-# =========================
-# MODEL (IMPROVED)
-# =========================
-def build_model():
-    model = Sequential()
-
-    model.add(LSTM(96, return_sequences=True, input_shape=(SEQ_LEN, 1)))
-    model.add(Dropout(0.2))
-
-    model.add(LSTM(48))
-    model.add(Dropout(0.2))
-
-    model.add(Dense(32, activation="relu"))
-    model.add(Dense(1))
-
-    model.compile(optimizer="adam", loss="mse")
-    return model
-
-
-def train_model():
+def train():
     global model
 
     if len(df) < MIN_DATA:
         return
 
-    X, y = prepare_data(df["multiplier"])
+    X, y = prepare(df["multiplier"])
 
     if model is None:
         model = build_model()
@@ -111,13 +91,23 @@ def train_model():
 
 
 # =========================
-# PREDICTION
+# 🧠 SELF LEARNING BIAS CORRECTION
 # =========================
-def ai_predict(seq):
+def get_bias():
+    if len(memory) < 5:
+        return 0
+
+    return memory["error"].mean()
+
+
+# =========================
+# PREDICT (WITH SELF LEARNING)
+# =========================
+def predict(seq):
     global model
 
-    if model is None:
-        return None
+    if len(df) < MIN_DATA or model is None:
+        return np.mean(seq)
 
     if len(seq) < SEQ_LEN:
         seq = [np.mean(seq)] * (SEQ_LEN - len(seq)) + seq
@@ -128,12 +118,31 @@ def ai_predict(seq):
     pred = model.predict(scaled.reshape(1, SEQ_LEN, 1), verbose=0)
     value = scaler.inverse_transform(pred)[0][0]
 
+    # 🔥 APPLY LEARNED BIAS CORRECTION
+    bias = get_bias()
+    value = value - bias
+
     return round(float(value), 2)
 
 
-def fallback_predict(seq):
-    arr = np.array(seq)
-    return round(float(np.mean(arr) + (arr[-1] - arr[0]) * 0.3), 2)
+# =========================
+# UPDATE MEMORY (SELF LEARNING CORE)
+# =========================
+def update_memory(predicted, actual):
+    global memory
+
+    error = actual - predicted
+
+    memory = pd.concat([
+        memory,
+        pd.DataFrame([{
+            "predicted": predicted,
+            "actual": actual,
+            "error": error
+        }])
+    ], ignore_index=True)
+
+    memory.to_csv(MEMORY_FILE, index=False)
 
 
 # =========================
@@ -145,10 +154,7 @@ def add(message):
     global df
 
     try:
-        value = float(message.text.split()[1])
-
-        # 🧼 AUTO CLEAN (NO REJECTION)
-        value = clean_value(value)
+        value = clean(float(message.text.split()[1]))
 
         df = pd.concat(
             [df, pd.DataFrame([{"multiplier": value}])],
@@ -157,47 +163,70 @@ def add(message):
 
         df.to_csv(DATA_FILE, index=False)
 
-        train_model()
+        train()
 
-        bot.reply_to(message, f"✅ Added (cleaned): {value}")
+        bot.reply_to(message, f"✅ Added: {value}")
 
     except:
         bot.reply_to(message, "❌ Usage: /add 1.5")
 
 
 @bot.message_handler(commands=['predict'])
-def predict(message):
+def handle_predict(message):
     try:
         numbers = list(map(float, message.text.split()[1:]))
 
-        if len(df) >= MIN_DATA:
-            pred = ai_predict(numbers)
-            mode = "AI MODEL"
-        else:
-            pred = fallback_predict(numbers)
-            mode = "FALLBACK"
+        pred = predict(numbers)
 
-        if pred < 1.5:
-            label = "LOW"
-        elif pred < 3:
-            label = "MID"
-        else:
-            label = "HIGH"
+        label = "LOW" if pred < 1.5 else "MID" if pred < 3 else "HIGH"
 
         bot.reply_to(
             message,
-            f"✈️ {mode}\n"
-            f"Result: {label} — {pred}x"
+            f"✈️ Prediction: {label} — {pred}x"
         )
 
     except Exception as e:
-        bot.reply_to(message, f"Error: {e}")
+        bot.reply_to(message, str(e))
+
+
+# =========================
+# OPTIONAL: FEEDBACK LEARNING
+# =========================
+@bot.message_handler(commands=['result'])
+def result(message):
+    """
+    User sends real outcome:
+    /result 2.1
+    Bot learns from last prediction
+    """
+    global memory
+
+    try:
+        actual = float(message.text.split()[1])
+        actual = clean(actual)
+
+        if len(memory) == 0:
+            bot.reply_to(message, "⚠️ No prediction to compare")
+            return
+
+        last_pred = memory.iloc[-1]["predicted"]
+
+        update_memory(last_pred, actual)
+
+        bot.reply_to(message, "🧠 Learned from mistake!")
+
+    except:
+        bot.reply_to(message, "❌ Usage: /result 2.1")
 
 
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.reply_to(message, "🤖 Auto-Clean AI Bot Ready")
+    bot.reply_to(
+        message,
+        "🤖 Self-Learning AI Bot Active\n"
+        "/add /predict /result"
+    )
 
 
-print("Bot running...")
+print("🤖 Self-learning bot running...")
 bot.infinity_polling()
