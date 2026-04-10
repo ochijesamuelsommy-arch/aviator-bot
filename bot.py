@@ -12,15 +12,21 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout
 # =========================
 DATA_FILE = "aviator_data.csv"
 SEQ_LEN = 10
-MIN_DATA = 60
+MIN_DATA = 20
 
+# =========================
+# TOKEN
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_TOKEN = BOT_TOKEN.strip() if BOT_TOKEN else None
+
+if not BOT_TOKEN:
+    raise Exception("BOT_TOKEN missing")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # =========================
-# DATA
+# DATA LOAD
 # =========================
 if os.path.exists(DATA_FILE):
     df = pd.read_csv(DATA_FILE)
@@ -30,6 +36,12 @@ else:
 scaler = MinMaxScaler()
 model = None
 
+# =========================
+# CLEAN DATA
+# =========================
+def clean_value(v):
+    v = max(1.01, min(float(v), 20))
+    return round(v, 2)
 
 # =========================
 # MODEL
@@ -45,15 +57,17 @@ def build_model():
     m.compile(optimizer="adam", loss="mse")
     return m
 
-
+# =========================
+# TRAIN
+# =========================
 def train_model():
     global model
 
     if len(df) < MIN_DATA:
         return
 
-    arr = df["multiplier"].values.reshape(-1, 1)
-    scaled = scaler.fit_transform(arr)
+    data = df["multiplier"].values.reshape(-1, 1)
+    scaled = scaler.fit_transform(data)
 
     X, y = [], []
 
@@ -68,12 +82,10 @@ def train_model():
 
     model.fit(X, y, epochs=20, batch_size=8, verbose=0)
 
-
 # =========================
-# ENSEMBLE MODELS
+# ENSEMBLE ENGINE
 # =========================
-
-def model_lstm(seq):
+def lstm_predict(seq):
     if model is None:
         return None
 
@@ -87,64 +99,64 @@ def model_lstm(seq):
     return scaler.inverse_transform(pred)[0][0]
 
 
-def model_stat(seq):
+def stat_predict(seq):
     arr = np.array(seq)
-
-    mean = np.mean(arr)
-    std = np.std(arr)
-
-    # probabilistic spread model
-    return mean + (np.random.randn() * std * 0.1)
+    return np.mean(arr) + np.std(arr) * 0.1
 
 
-def model_trend(seq):
+def trend_predict(seq):
     arr = np.array(seq)
     if len(arr) < 2:
         return np.mean(arr)
+    return np.mean(arr) + (arr[-1] - arr[0]) * 0.3
 
-    trend = arr[-1] - arr[0]
-    return np.mean(arr) + trend * 0.4
 
+def ensemble(seq):
+    preds = []
+
+    for p in [lstm_predict(seq), stat_predict(seq), trend_predict(seq)]:
+        if p is not None:
+            preds.append(p)
+
+    return float(np.mean(preds))
 
 # =========================
 # PROBABILITY ENGINE
 # =========================
-def probability_engine(seq):
-    lstm = model_lstm(seq)
-    stat = model_stat(seq)
-    trend = model_trend(seq)
+def probabilities(value):
+    low = max(0, 100 - value * 30)
+    mid = max(0, 100 - abs(value - 2) * 40)
+    high = max(0, value * 20)
 
-    predictions = [p for p in [lstm, stat, trend] if p is not None]
-
-    final = np.mean(predictions)
-
-    # probability buckets
-    low_p = max(0, 100 - final * 35)
-    mid_p = max(0, 100 - abs(final - 2.0) * 40)
-    high_p = max(0, final * 20)
-
-    total = low_p + mid_p + high_p
+    total = low + mid + high
     if total == 0:
         total = 1
 
-    low_p = round((low_p / total) * 100, 2)
-    mid_p = round((mid_p / total) * 100, 2)
-    high_p = round((high_p / total) * 100, 2)
-
-    return final, low_p, mid_p, high_p
-
+    return (
+        round(low / total * 100, 2),
+        round(mid / total * 100, 2),
+        round(high / total * 100, 2)
+    )
 
 # =========================
 # COMMANDS
 # =========================
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(
+        message,
+        "🤖 Expert AI Bot Ready\n"
+        "/add value\n/predict numbers\n/count"
+    )
+
 
 @bot.message_handler(commands=['add'])
 def add(message):
     global df
 
     try:
-        value = float(message.text.split()[1])
-        value = max(1.01, min(value, 20))
+        value = clean_value(message.text.split()[1])
 
         df = pd.concat([df, pd.DataFrame([{"multiplier": value}])], ignore_index=True)
         df.to_csv(DATA_FILE, index=False)
@@ -162,23 +174,24 @@ def predict(message):
     try:
         seq = list(map(float, message.text.split()[1:]))
 
-        if len(df) < 20:
-            bot.reply_to(message, "⚠️ Need more data (20+ recommended)")
+        if len(df) < 5:
+            bot.reply_to(message, "⚠️ Not enough data yet")
             return
 
-        final, low_p, mid_p, high_p = probability_engine(seq)
+        value = ensemble(seq)
+        low, mid, high = probabilities(value)
 
-        label = "LOW" if low_p > max(mid_p, high_p) else "MID" if mid_p > high_p else "HIGH"
+        label = "LOW" if low > max(mid, high) else "MID" if mid > high else "HIGH"
 
         bot.reply_to(
             message,
-            f"🧠 EXPERT ENSEMBLE AI\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"Prediction: {final:.2f}x\n\n"
-            f"📊 Probabilities:\n"
-            f"LOW: {low_p}%\n"
-            f"MID: {mid_p}%\n"
-            f"HIGH: {high_p}%\n\n"
+            f"🧠 EXPERT AI SYSTEM\n"
+            f"━━━━━━━━━━━━\n"
+            f"Prediction: {value:.2f}x\n\n"
+            f"📊 Probability:\n"
+            f"LOW: {low}%\n"
+            f"MID: {mid}%\n"
+            f"HIGH: {high}%\n\n"
             f"🎯 Signal: {label}"
         )
 
@@ -186,14 +199,19 @@ def predict(message):
         bot.reply_to(message, f"Error: {e}")
 
 
-@bot.message_handler(commands=['start'])
-def start(message):
+@bot.message_handler(commands=['count'])
+def count(message):
     bot.reply_to(
         message,
-        "🤖 Expert Ensemble Bot Active\n"
-        "/add /predict"
+        f"📊 Dataset Info:\n"
+        f"Total records: {len(df)}\n"
+        f"Average: {df['multiplier'].mean() if len(df)>0 else 0:.2f}\n"
+        f"Max: {df['multiplier'].max() if len(df)>0 else 0}\n"
+        f"Min: {df['multiplier'].min() if len(df)>0 else 0}"
     )
 
-
-print("🚀 Expert bot running...")
+# =========================
+# RUN
+# =========================
+print("🚀 Final Expert Bot Running...")
 bot.infinity_polling()
